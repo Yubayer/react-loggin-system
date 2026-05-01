@@ -1,0 +1,258 @@
+
+/**
+ * =========================================================
+ * JHLogger + FULL DEMO (Single Page Production Example)
+ * Framework: React Router v7 / SPA / Node-safe
+ * =========================================================
+ */
+
+/* =========================================================
+ * LOGGER CORE
+ * ========================================================= */
+class JHLogger {
+  constructor(options = {}) {
+    this.enabled = options.enabled ?? true;
+    this.verbose = options.verbose ?? false;
+    this.level = options.level || "info";
+    this.middlewares = [];
+  }
+
+  /* -------------------------
+   * LOG LEVELS
+   * ------------------------- */
+  _levels = {
+    debug: 0,
+    info: 1,
+    warn: 2,
+    error: 3,
+  };
+
+  _canLog(level) {
+    return this._levels[level] >= this._levels[this.level];
+  }
+
+  /* -------------------------
+   * ENV SUPPORT
+   * ------------------------- */
+  static fromEnv() {
+    const isDev =
+      typeof process !== "undefined" &&
+      process.env?.NODE_ENV === "development";
+
+    return new JHLogger({
+      enabled: true,
+      verbose: isDev,
+      level: isDev ? "debug" : "error",
+    });
+  }
+
+  /* -------------------------
+   * MIDDLEWARE
+   * ------------------------- */
+  use(fn) {
+    this.middlewares.push(fn);
+    return this;
+  }
+
+  async _runMiddlewares(log) {
+    for (const mw of this.middlewares) {
+      try {
+        await mw(log);
+      } catch (err) {
+        console.error("Middleware Error:", err);
+      }
+    }
+  }
+
+  /* -------------------------
+   * CORE LOG FUNCTION
+   * ------------------------- */
+  async _log(level, message, data) {
+    if (!this.enabled || !this._canLog(level)) return;
+
+    const log = {
+      level,
+      message,
+      data,
+      time: new Date().toISOString(),
+    };
+
+    await this._runMiddlewares(log);
+
+    const prefix = `[JHLogger:${level.toUpperCase()}]`;
+
+    if (level === "error") console.error(prefix, message, data || "");
+    else if (level === "warn") console.warn(prefix, message, data || "");
+    else console.log(prefix, message, data || "");
+
+    if (this.verbose) {
+      console.log("🔎 DEBUG:", log);
+    }
+  }
+
+  debug(m, d) { return this._log("debug", m, d); }
+  info(m, d) { return this._log("info", m, d); }
+  warn(m, d) { return this._log("warn", m, d); }
+  error(m, d) { return this._log("error", m, d); }
+
+  /* -------------------------
+   * UTILITIES
+   * ------------------------- */
+  time(label) {
+    console.time("⏱ " + label);
+  }
+
+  timeEnd(label) {
+    console.timeEnd("⏱ " + label);
+  }
+
+  group(label) {
+    console.group("📦 " + label);
+  }
+
+  groupEnd() {
+    console.groupEnd();
+  }
+
+  /* -------------------------
+   * ROUTE TRACKING (mock React Router v7)
+   * ------------------------- */
+  trackRoutes(router) {
+    if (!router?.subscribe) return;
+
+    router.subscribe((state) => {
+      this.info("Route Changed", {
+        path: state.location.pathname,
+        search: state.location.search,
+      });
+    });
+  }
+}
+
+/* =========================================================
+ * GLOBAL LOGGER INSTANCE
+ * ========================================================= */
+const logger = JHLogger.fromEnv();
+
+/* =========================================================
+ * MIDDLEWARE EXAMPLE (analytics / monitoring)
+ * ========================================================= */
+logger.use((log) => {
+  if (log.level === "error") {
+    console.log("📤 Sending to monitoring system:", log);
+  }
+});
+
+/* =========================================================
+ * MOCK ROUTER (React Router v7 simulation)
+ * ========================================================= */
+const mockRouter = {
+  listeners: [],
+  location: { pathname: "/" },
+
+  subscribe(fn) {
+    this.listeners.push(fn);
+  },
+
+  navigate(path) {
+    this.location.pathname = path;
+    this.listeners.forEach((fn) =>
+      fn({ location: this.location })
+    );
+  },
+};
+
+/* attach route tracking */
+logger.trackRoutes(mockRouter);
+
+/* =========================================================
+ * REAL-WORLD USE CASES
+ * ========================================================= */
+
+/* -------------------------
+ * 1. APP START
+ * ------------------------- */
+logger.info("App started");
+
+/* -------------------------
+ * 2. CART FLOW
+ * ------------------------- */
+function addToCart() {
+  logger.group("Cart Flow");
+
+  logger.info("Adding product", { id: 101, name: "T-Shirt" });
+  logger.debug("Cart state updated");
+
+  logger.time("cart-process");
+
+  setTimeout(() => {
+    logger.info("Cart saved to server");
+    logger.timeEnd("cart-process");
+
+    logger.groupEnd();
+  }, 500);
+}
+
+addToCart();
+
+/* -------------------------
+ * 3. CHECKOUT FLOW (ERROR CASE)
+ * ------------------------- */
+function checkout() {
+  logger.group("Checkout Flow");
+
+  try {
+    throw new Error("Payment gateway failed");
+  } catch (err) {
+    logger.error("Checkout failed", {
+      message: err.message,
+    });
+  }
+
+  logger.groupEnd();
+}
+
+checkout();
+
+/* -------------------------
+ * 4. ROUTE CHANGES
+ * ------------------------- */
+mockRouter.navigate("/shop");
+mockRouter.navigate("/product/101");
+mockRouter.navigate("/checkout");
+
+/* -------------------------
+ * 5. ANALYTICS EVENTS
+ * ------------------------- */
+function trackEvent(name, data) {
+  logger.info("Analytics Event", {
+    event: name,
+    data,
+  });
+}
+
+trackEvent("product_view", { id: 101 });
+trackEvent("add_to_cart", { id: 101 });
+
+/* -------------------------
+ * 6. DEBUG MODE EXAMPLE
+ * ------------------------- */
+logger.verbose = true;
+
+logger.debug("Debug state dump", {
+  cart: { items: 2 },
+  user: "Jobayer",
+});
+
+/* -------------------------
+ * 7. WARN EXAMPLE
+ * ------------------------- */
+logger.warn("API response slow > 2s");
+
+/* -------------------------
+ * 8. ERROR EXAMPLE
+ * ------------------------- */
+logger.error("Unhandled exception", {
+  code: 500,
+  service: "payment",
+});
