@@ -1,0 +1,614 @@
+/**
+ * ============================================================
+ *  JHLogger — Production-Grade Logger
+ *  Framework : React Router v7 / SPA / Node-safe
+ *  Author    : Jobayer Hossain
+ * ============================================================
+ */
+
+class JHLogger {
+
+  /* ----------------------------------------------------------
+   * STATIC LEVEL MAP
+   * প্রতিটা level এর numeric priority।
+   * static রাখার কারণ: প্রতি instance এ নতুন object
+   * তৈরি হওয়া wasteful — এটা সবার জন্য একই।
+   * ---------------------------------------------------------- */
+  static _LEVELS = {
+    debug : 0,
+    info  : 1,
+    warn  : 2,
+    error : 3,
+  };
+
+  /* ----------------------------------------------------------
+   * PRIVATE FIELDS  (#)
+   * JavaScript private class fields — বাইরে থেকে
+   * সরাসরি access বা overwrite করা যাবে না।
+   * শুধু getter/setter দিয়ে controlled access।
+   * ---------------------------------------------------------- */
+  #verbose      = false;
+  #level        = 'info';
+  #middlewares  = [];
+  #routerUnsub  = null;
+  #store        = [];
+
+  /* ----------------------------------------------------------
+   * CONSTANTS
+   * ---------------------------------------------------------- */
+  static #MAX_MIDDLEWARES = 20;
+  static #MAX_STORE       = 200;
+
+  /* ----------------------------------------------------------
+   * CONSTRUCTOR
+   * ---------------------------------------------------------- */
+  constructor(options = {}) {
+    this.enabled  = options.enabled  ?? true;
+    this.#verbose = options.verbose  ?? false;
+    this.#level   = options.level    ?? 'info';
+  }
+
+  /* ----------------------------------------------------------
+   * GETTERS / SETTERS
+   *
+   * verbose setter — falsy/truthy যা-ই আসুক, Boolean এ
+   * convert করে safe রাখে।
+   *
+   * level setter — invalid value দিলে warn করে এবং
+   * পুরনো value ধরে রাখে, crash করে না।
+   * ---------------------------------------------------------- */
+  get verbose()    { return this.#verbose; }
+  set verbose(val) { this.#verbose = Boolean(val); }
+
+  get level()    { return this.#level; }
+  set level(val) {
+    if (!(val in JHLogger._LEVELS)) {
+      console.warn(`[JHLogger] Invalid level: "${val}". Keeping "${this.#level}"`);
+      return;
+    }
+    this.#level = val;
+  }
+
+  /* ----------------------------------------------------------
+   * fromEnv()  —  STATIC FACTORY
+   *
+   * Environment দেখে নিজে নিজে config করে instance দেয়।
+   * Vite / Cloudflare Pages এ import.meta.env.DEV আছে।
+   * Node.js এ process.env.NODE_ENV আছে।
+   * দুটোই check করে যেটা পাওয়া যায় সেটা ব্যবহার করে।
+   * ---------------------------------------------------------- */
+  static fromEnv() {
+    const isDev =
+      (typeof import.meta !== 'undefined' && import.meta.env?.DEV === true) ||
+      (typeof process     !== 'undefined' && process.env?.NODE_ENV === 'development');
+
+    return new JHLogger({
+      enabled : true,
+      verbose : isDev,
+      level   : isDev ? 'debug' : 'error',
+    });
+  }
+
+  /* ----------------------------------------------------------
+   * _canLog()  —  LEVEL GATE
+   *
+   * বর্তমান minimum level এর চেয়ে ছোট level এর
+   * messages skip করে।
+   * e.g. level='warn' হলে debug/info print হবে না।
+   * ---------------------------------------------------------- */
+  _canLog(level) {
+    return JHLogger._LEVELS[level] >= JHLogger._LEVELS[this.#level];
+  }
+
+  /* ----------------------------------------------------------
+   * use()  —  MIDDLEWARE REGISTER
+   *
+   * প্রতিটা log entry middleware pipeline দিয়ে যায়।
+   * Use case: analytics, error monitoring (Sentry), remote logging।
+   *
+   * Cap: 20 — accidental double-registration ধরার জন্য।
+   * Chainable: logger.use(fn1).use(fn2) কাজ করে।
+   * ---------------------------------------------------------- */
+  use(fn) {
+    if (typeof fn !== 'function') {
+      throw new TypeError('[JHLogger] use() এ function দিতে হবে');
+    }
+    if (this.#middlewares.length >= JHLogger.#MAX_MIDDLEWARES) {
+      console.warn(`[JHLogger] Middleware cap (${JHLogger.#MAX_MIDDLEWARES}) reached. "${fn.name || 'anonymous'}" যোগ হয়নি।`);
+      return this;
+    }
+    this.#middlewares.push(fn);
+    return this;
+  }
+
+  /* ----------------------------------------------------------
+   * remove()  —  MIDDLEWARE UNREGISTER
+   *
+   * use() এর বিপরীত।
+   * Same function reference দিয়ে তুলে নেওয়া যায়।
+   *
+   * e.g.
+   *   const myMw = (log) => { ... };
+   *   logger.use(myMw);
+   *   logger.remove(myMw);
+   * ---------------------------------------------------------- */
+  remove(fn) {
+    this.#middlewares = this.#middlewares.filter(mw => mw !== fn);
+    return this;
+  }
+
+  /* ----------------------------------------------------------
+   * _log()  —  CORE ENGINE  (synchronous)
+   *
+   * কেন synchronous?
+   *   Console I/O নিজেই synchronous। async _log থাকলে
+   *   caller কে await করতে হয়, না করলে Promise silently
+   *   swallow হয়ে যায় — bug ধরা কঠিন হয়।
+   *
+   * Middleware কীভাবে চলে?
+   *   Promise.allSettled() দিয়ে fire-and-forget।
+   *   একটা middleware fail করলে বাকিগুলো থামে না।
+   *   সব failure console এ দেখা যায়।
+   *
+   * Store:
+   *   শেষ MAX_STORE টি entry memory তে রাখে।
+   *   getLogs() দিয়ে query করা যায়।
+   * ---------------------------------------------------------- */
+  _log(level, message, data) {
+    if (!this.enabled || !this._canLog(level)) return;
+
+    const entry = {
+      level,
+      message,
+      data : data ?? null,
+      time : new Date().toISOString(),
+    };
+
+    // ── Store ──────────────────────────────────────────────
+    this.#store.push(entry);
+    if (this.#store.length > JHLogger.#MAX_STORE) {
+      this.#store.shift();
+    }
+
+    // ── Middleware (async, fire-and-forget) ────────────────
+    if (this.#middlewares.length > 0) {
+      Promise.allSettled(
+        this.#middlewares.map(mw => Promise.resolve().then(() => mw(entry)))
+      ).then(results => {
+        results.forEach((r, i) => {
+          if (r.status === 'rejected') {
+            console.error(`[JHLogger] Middleware[${i}] error:`, r.reason);
+          }
+        });
+      });
+    }
+
+    // ── Console Output ─────────────────────────────────────
+    const prefix = `[JH:${level.toUpperCase()}]`;
+
+    if      (level === 'error') console.error(prefix, message, data ?? '');
+    else if (level === 'warn')  console.warn (prefix, message, data ?? '');
+    else                        console.log  (prefix, message, data ?? '');
+
+    // ── Verbose Dump ───────────────────────────────────────
+    if (this.#verbose) {
+      console.log('🔎 VERBOSE:', entry);
+    }
+  }
+
+  /* ----------------------------------------------------------
+   * PUBLIC LOG METHODS
+   *
+   * void return — কেউ await করলেও কিছু হবে না,
+   * undefined পাবে, confusion নেই।
+   * ---------------------------------------------------------- */
+  debug(message, data) { this._log('debug', message, data); }
+  info (message, data) { this._log('info',  message, data); }
+  warn (message, data) { this._log('warn',  message, data); }
+  error(message, data) { this._log('error', message, data); }
+
+  /* ----------------------------------------------------------
+   * trackRoutes()  —  REACT ROUTER v7 INTEGRATION
+   *
+   * router.subscribe() এ listener attach করে।
+   * React Router v7 এ subscribe() একটা unsubscribe
+   * function return করে — সেটা save করে রাখি।
+   *
+   * দ্বিতীয়বার trackRoutes() call করলে আগেরটা আগে
+   * unsub করে নেয় — duplicate listener এড়ানোর জন্য।
+   * ---------------------------------------------------------- */
+  trackRoutes(router) {
+    if (!router?.subscribe) {
+      this.warn('trackRoutes()', 'router.subscribe নেই — tracking বন্ধ');
+      return;
+    }
+
+    this.untrackRoutes();
+
+    const handler = (state) => {
+      this.info('Route Changed', {
+        path   : state.location.pathname,
+        search : state.location.search,
+      });
+    };
+
+    const unsub = router.subscribe(handler);
+    this.#routerUnsub = typeof unsub === 'function' ? unsub : () => {};
+  }
+
+  /* ----------------------------------------------------------
+   * untrackRoutes()
+   *
+   * React Router listener সরিয়ে দেয়।
+   * Component unmount বা router destroy হলে call করো।
+   * ---------------------------------------------------------- */
+  untrackRoutes() {
+    this.#routerUnsub?.();
+    this.#routerUnsub = null;
+  }
+
+  /* ----------------------------------------------------------
+   * getLogs()  —  LOG STORE QUERY
+   *
+   * Memory তে রাখা logs filter করে দেয়।
+   * level দিলে শুধু সেই level বা তার উপরেরগুলো আসবে।
+   *
+   * e.g.
+   *   logger.getLogs()           → সব logs
+   *   logger.getLogs('warn')     → warn + error
+   *   logger.getLogs('error')    → শুধু error
+   * ---------------------------------------------------------- */
+  getLogs(level) {
+    if (!level) return [...this.#store];
+    const min = JHLogger._LEVELS[level] ?? 0;
+    return this.#store.filter(e => JHLogger._LEVELS[e.level] >= min);
+  }
+
+  /* ----------------------------------------------------------
+   * clearLogs()
+   * ---------------------------------------------------------- */
+  clearLogs() {
+    this.#store.length = 0;
+  }
+
+  /* ----------------------------------------------------------
+   * CONSOLE UTILITIES
+   *
+   * group/time এগুলো logger এর সাথে রাখার কারণ:
+   * একই import থেকে সব পাওয়া যায়,
+   * আলাদা console.group() মনে রাখতে হয় না।
+   * ---------------------------------------------------------- */
+  group   (label) { console.group   (`📦 ${label}`); }
+  groupEnd()      { console.groupEnd(); }
+  time    (label) { console.time    (`⏱ ${label}`); }
+  timeEnd (label) { console.timeEnd (`⏱ ${label}`); }
+}
+
+/* ============================================================
+ * SINGLETON EXPORT
+ *
+ * সারা app এ একটাই instance — সব জায়গায় same config,
+ * same store, same middlewares।
+ * আলাদা instance দরকার হলে: new JHLogger({ ... })
+ * ============================================================ */
+export const logger = JHLogger.fromEnv();
+export default JHLogger;
+
+
+/* ============================================================
+ *
+ *  ██████╗ ███████╗███╗   ███╗ ██████╗
+ *  ██╔══██╗██╔════╝████╗ ████║██╔═══██╗
+ *  ██║  ██║█████╗  ██╔████╔██║██║   ██║
+ *  ██║  ██║██╔══╝  ██║╚██╔╝██║██║   ██║
+ *  ██████╔╝███████╗██║ ╚═╝ ██║╚██████╔╝
+ *  ╚═════╝ ╚══════╝╚═╝     ╚═╝ ╚═════╝
+ *
+ *  FULL DEMO  —  Real-World Usage Examples
+ *  নিচের সব example production code এ কীভাবে
+ *  JHLogger ব্যবহার হবে তা দেখায়।
+ *
+ * ============================================================ */
+
+
+/* ------------------------------------------------------------
+ * DEMO 1: MIDDLEWARE SETUP
+ *
+ * Middleware হলো এমন function যে প্রতিটা log entry
+ * console এ যাওয়ার সাথে সাথে পায়।
+ *
+ * Use case:
+ *   - Error monitoring (Sentry, Datadog)
+ *   - Remote logging (কোনো API তে পাঠানো)
+ *   - Analytics event tracking
+ *
+ * Important: middleware async হতে পারে, কিন্তু
+ * logger main thread block করবে না।
+ * ------------------------------------------------------------ */
+const errorMonitor = async (log) => {
+  if (log.level === 'error') {
+    // real app এ: await Sentry.captureMessage(log.message, log.data)
+    console.log('📤 Error monitor received:', log);
+  }
+};
+
+logger.use(errorMonitor);
+
+/* middleware remove করার example:
+   logger.remove(errorMonitor);
+*/
+
+
+/* ------------------------------------------------------------
+ * DEMO 2: ROUTER TRACKING — React Router v7
+ *
+ * React Router v7 এ router object এ subscribe() আছে।
+ * সেটা trackRoutes() এ দিলে route change
+ * automatically log হয়।
+ *
+ * React component এ কীভাবে করবে:
+ *
+ *   import { createBrowserRouter } from 'react-router';
+ *
+ *   const router = createBrowserRouter([...]);
+ *   logger.trackRoutes(router);
+ *
+ *   // Component unmount এ:
+ *   useEffect(() => {
+ *     logger.trackRoutes(router);
+ *     return () => logger.untrackRoutes();
+ *   }, []);
+ *
+ * নিচে mock দিয়ে simulate করা হয়েছে:
+ * ------------------------------------------------------------ */
+const mockRouter = {
+  _listeners : [],
+
+  subscribe(fn) {
+    this._listeners.push(fn);
+    // React Router v7 unsubscribe pattern return করে
+    return () => {
+      this._listeners = this._listeners.filter(l => l !== fn);
+    };
+  },
+
+  navigate(path) {
+    this._listeners.forEach(fn =>
+      fn({ location: { pathname: path, search: '' } })
+    );
+  },
+};
+
+logger.trackRoutes(mockRouter);
+
+mockRouter.navigate('/shop');
+mockRouter.navigate('/product/101');
+mockRouter.navigate('/checkout');
+
+/* এখন untrack করা যাবে যেকোনো সময়:
+   logger.untrackRoutes();
+*/
+
+
+/* ------------------------------------------------------------
+ * DEMO 3: APP STARTUP LOG
+ *
+ * App প্রথম load হলে কী কী log করা উচিত:
+ *   - version
+ *   - environment
+ *   - feature flags
+ *   - user session আছে কিনা
+ * ------------------------------------------------------------ */
+logger.info('App Started', {
+  version : '1.0.0',
+  env     : 'development',
+  locale  : 'bn-BD',
+});
+
+
+/* ------------------------------------------------------------
+ * DEMO 4: CART FLOW — group + time
+ *
+ * group() দিয়ে related logs একসাথে collapse করা যায়।
+ * DevTools এ পড়তে অনেক সহজ হয়।
+ *
+ * time() / timeEnd() দিয়ে কোনো operation কত সময়
+ * নিলো measure করা যায়।
+ * ------------------------------------------------------------ */
+function addToCart(product) {
+  logger.group('Cart Flow');
+
+  logger.info('Product added', { id: product.id, name: product.name });
+  logger.debug('Cart state updating...');
+  logger.time('cart-save');
+
+  // async operation simulate
+  setTimeout(() => {
+    logger.info('Cart saved to server');
+    logger.timeEnd('cart-save');
+    logger.groupEnd();
+  }, 500);
+}
+
+addToCart({ id: 101, name: 'Premium T-Shirt', price: 899 });
+
+
+/* ------------------------------------------------------------
+ * DEMO 5: CHECKOUT FLOW — error handling
+ *
+ * try/catch এর ভেতরে error লগ করার সঠিক উপায়।
+ * error() তে error object টাও data হিসেবে পাঠাও —
+ * stack trace পরে debugging এ কাজে লাগে।
+ * ------------------------------------------------------------ */
+function processCheckout(cartId) {
+  logger.group('Checkout Flow');
+  logger.info('Checkout initiated', { cartId });
+
+  try {
+    // simulate payment failure
+    throw new Error('Payment gateway timeout');
+  } catch (err) {
+    logger.error('Checkout failed', {
+      message : err.message,
+      stack   : err.stack,
+      cartId,
+    });
+  } finally {
+    logger.groupEnd();
+  }
+}
+
+processCheckout('cart_abc123');
+
+
+/* ------------------------------------------------------------
+ * DEMO 6: ANALYTICS EVENT TRACKING
+ *
+ * User action এর জন্য structured event log।
+ * Middleware এ এই info events ধরে analytics
+ * platform এ পাঠানো যায় (Mixpanel, Amplitude)।
+ * ------------------------------------------------------------ */
+function trackEvent(name, properties = {}) {
+  logger.info('Analytics Event', {
+    event      : name,
+    properties,
+    timestamp  : Date.now(),
+  });
+}
+
+trackEvent('product_viewed',  { productId: 101, source: 'search' });
+trackEvent('add_to_cart',     { productId: 101, quantity: 1 });
+trackEvent('checkout_started',{ cartValue: 899, currency: 'BDT' });
+
+
+/* ------------------------------------------------------------
+ * DEMO 7: VERBOSE / DEBUG MODE
+ *
+ * verbose = true হলে প্রতিটা log এর full entry object
+ * আলাদা করে print হয়।
+ *
+ * Production এ verbose = false রাখো।
+ * Debug করতে হলে:
+ *   logger.verbose = true;
+ *   // ... কাজ করো
+ *   logger.verbose = false;
+ * ------------------------------------------------------------ */
+logger.verbose = true;
+
+logger.debug('Full state dump', {
+  cart  : { items: 3, total: 1799 },
+  user  : { id: 'usr_42', role: 'customer' },
+  flags : { darkMode: true, betaCheckout: false },
+});
+
+logger.verbose = false;   // debug শেষে বন্ধ করো
+
+
+/* ------------------------------------------------------------
+ * DEMO 8: LEVEL VALIDATION
+ *
+ * Invalid level দিলে logger crash করে না।
+ * Warning দিয়ে আগের level ধরে রাখে।
+ * ------------------------------------------------------------ */
+logger.level = 'critical'; // → warn দেবে, level পরিবর্তন হবে না
+logger.level = 'warn';     // → এখন শুধু warn + error দেখাবে
+logger.level = 'debug';    // → আবার সব দেখাবে
+
+
+/* ------------------------------------------------------------
+ * DEMO 9: getLogs() — STORE QUERY
+ *
+ * Memory তে রাখা logs এ query করা।
+ * Debugging panel, error report, export এ কাজে লাগে।
+ * ------------------------------------------------------------ */
+const allLogs    = logger.getLogs();
+const errorLogs  = logger.getLogs('error');
+const warnAndUp  = logger.getLogs('warn');
+
+logger.info(`Store state`, {
+  total  : allLogs.length,
+  errors : errorLogs.length,
+  warns  : warnAndUp.length,
+});
+
+/* logs export করতে:
+   const json = JSON.stringify(logger.getLogs(), null, 2);
+   // file এ লেখো বা API তে পাঠাও
+*/
+
+
+/* ------------------------------------------------------------
+ * DEMO 10: MULTIPLE INSTANCES
+ *
+ * singleton (logger) সারা app এর জন্য।
+ * কিন্তু কোনো module এ আলাদা config দরকার হলে
+ * নতুন instance বানানো যাবে।
+ * ------------------------------------------------------------ */
+const paymentLogger = new JHLogger({
+  enabled : true,
+  verbose : false,
+  level   : 'warn',  // payment module এ শুধু warn/error
+});
+
+paymentLogger.warn('Payment API response slow', { latency: '2400ms' });
+paymentLogger.error('Payment failed', { code: 'CARD_DECLINED' });
+
+
+/* ------------------------------------------------------------
+ * DEMO 11: MIDDLEWARE REMOVAL
+ *
+ * Conditional middleware — শুধু authenticated user এর
+ * জন্য remote logging চালু করার example।
+ * ------------------------------------------------------------ */
+const remoteLogger = async (log) => {
+  // real app এ:
+  // await fetch('/api/logs', { method: 'POST', body: JSON.stringify(log) });
+  console.log('📡 Remote log sent:', log.level, log.message);
+};
+
+// user login হলে চালু করো:
+logger.use(remoteLogger);
+
+// user logout হলে বন্ধ করো:
+logger.remove(remoteLogger);
+
+
+/* ============================================================
+ *
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │                  QUICK REFERENCE                    │
+ *  ├─────────────────────────────────────────────────────┤
+ *  │  logger.debug(msg, data?)   low-level trace         │
+ *  │  logger.info(msg, data?)    normal events           │
+ *  │  logger.warn(msg, data?)    unexpected but ok       │
+ *  │  logger.error(msg, data?)   needs attention         │
+ *  ├─────────────────────────────────────────────────────┤
+ *  │  logger.use(fn)             middleware add          │
+ *  │  logger.remove(fn)          middleware remove       │
+ *  ├─────────────────────────────────────────────────────┤
+ *  │  logger.trackRoutes(router) route change logging    │
+ *  │  logger.untrackRoutes()     cleanup                 │
+ *  ├─────────────────────────────────────────────────────┤
+ *  │  logger.getLogs(level?)     query store             │
+ *  │  logger.clearLogs()         clear store             │
+ *  ├─────────────────────────────────────────────────────┤
+ *  │  logger.verbose = true/false  toggle dump mode      │
+ *  │  logger.level   = 'debug' | 'info' | 'warn' |      │
+ *  │                   'error'                           │
+ *  ├─────────────────────────────────────────────────────┤
+ *  │  logger.group(label)        console group open      │
+ *  │  logger.groupEnd()          console group close     │
+ *  │  logger.time(label)         start timer             │
+ *  │  logger.timeEnd(label)      stop + print timer      │
+ *  └─────────────────────────────────────────────────────┘
+ *
+ *  ENV AUTO-CONFIG (JHLogger.fromEnv()):
+ *   development  →  level: debug,  verbose: true
+ *   production   →  level: error,  verbose: false
+ *
+ *  Enable verbose at runtime (browser console):
+ *    window.__logger = logger   ← main.js এ set করো
+ *    __logger.verbose = true
+ *    __logger.level = 'debug'
+ *
+ * ============================================================ */
